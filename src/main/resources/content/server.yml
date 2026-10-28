@@ -1,0 +1,23 @@
+# 核心只保留一条更新日志；玩法章节与文章由各插件通过 API 贡献。
+# 此文件只在首次初始化时生成，删除后重启不会恢复。
+categories:
+  - id: handbook:updates
+    title: 服务器更新
+    description: 按日期查阅服务器更新记录
+    icon: WRITABLE_BOOK
+    order: 40
+entries:
+  - id: handbook:update-2026-10-26
+    category: handbook:updates
+    title: 2026.10.26 手册上线
+    summary: 在统一手册中查阅玩法与服务器更新
+    order: -20261026
+    keywords: [更新, 日志, 手册]
+    pages:
+      - title: 手册上线
+        blocks:
+          - '服务器手册现已开放。'
+          - type: space
+          - '可在目录中查阅已上线玩法的指引与服务器更新记录。'
+          - type: space
+          - '支持图文阅读、关键词检索与翻页。'

@@ -1,0 +1,319 @@
+import groovy.json.JsonSlurper
+import groovy.json.JsonOutput
+import java.awt.*
+import java.awt.image.BufferedImage
+import javax.imageio.ImageIO
+import java.util.zip.ZipFile
+
+def generated = layout.buildDirectory.dir('generated/book-resources')
+def clientSource = rootProject.layout.projectDirectory.file('.gradle/handbook-assets/client-26.3.jar')
+tasks.register('downloadIconSource') {
+    outputs.file(clientSource)
+    def localClient=providers.gradleProperty('minecraftClientJar')
+    if(localClient.isPresent()) inputs.file(file(localClient.get()))
+    doLast {
+        def target = clientSource.asFile
+        target.parentFile.mkdirs()
+        def expected = 'e877b6a07acd633fb3bb475002175cec036e7b87'
+        if(localClient.isPresent()) {
+            java.nio.file.Files.copy(file(localClient.get()).toPath(),target.toPath(),java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+        } else if (!target.exists()) {
+            if(gradle.startParameter.offline) throw new GradleException('缺少图标源缓存，先联网构建或提供 -PminecraftClientJar')
+            def temporary=new File(target.path+'.part')
+            try {
+                def connection=new URI("https://piston-data.mojang.com/v1/objects/${expected}/client.jar").toURL().openConnection()
+                connection.connectTimeout=30000;connection.readTimeout=120000
+                connection.inputStream.withCloseable { input -> temporary.withOutputStream { it << input } }
+                if(java.security.MessageDigest.getInstance('SHA-1').digest(temporary.bytes).encodeHex().toString()!=expected) throw new GradleException('Minecraft 图标源下载校验失败')
+                java.nio.file.Files.move(temporary.toPath(),target.toPath(),java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            } finally {temporary.delete()}
+        }
+        def digest = java.security.MessageDigest.getInstance('SHA-1')
+        target.withInputStream { input -> byte[] b = new byte[65536]; int n; while ((n = input.read(b)) > 0) digest.update(b, 0, n) }
+        if (digest.digest().encodeHex().toString() != expected) {
+            target.delete()
+            throw new GradleException('Minecraft 图标索引源校验失败，请重新构建')
+        }
+    }
+}
+tasks.register('compileBookFont') {
+    inputs.file('assets/fonts/DroidSansFallbackFull.ttf')
+    inputs.file('assets/fonts/DejaVuSansMono.ttf')
+    inputs.files('assets/fonts/LICENSE.txt', 'assets/fonts/DejaVu-LICENSE.txt')
+    outputs.dir(layout.buildDirectory.dir('generated/font-resources'))
+    doLast {
+        def root = layout.buildDirectory.dir('generated/font-resources').get().asFile
+        def target = new File(root, 'ce-pack/handbookcore/resourcepack/assets/handbookcore')
+        new File(target, 'textures/font').mkdirs(); new File(target, 'font').mkdirs()
+        def font = Font.createFont(Font.TRUETYPE_FONT, file('assets/fonts/DroidSansFallbackFull.ttf')).deriveFont(14.0f)
+        def latin = Font.createFont(Font.TRUETYPE_FONT, file('assets/fonts/DejaVuSansMono.ttf')).deriveFont(14.0f)
+        def atlas = new BufferedImage(4096, 4096, BufferedImage.TYPE_INT_ARGB)
+        def g = atlas.createGraphics(); g.setFont(font); g.setColor(Color.WHITE)
+        g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_OFF)
+        def supported = new BitSet(65536)
+        def rows = []
+        for (int y = 0; y < 256; y++) {
+            def chars = new StringBuilder()
+            for (int x = 0; x < 256; x++) {
+                int cp = y * 256 + x
+                def selected = font.canDisplay(cp) ? font : latin.canDisplay(cp) ? latin : null
+                if (cp >= 32 && !(cp >= 0xd800 && cp <= 0xdfff) && selected != null) {
+                    supported.set(cp); chars.append((char)cp)
+                    g.setFont(selected)
+                    String value = String.valueOf((char)cp)
+                    int inset = Math.max(0, (16-g.getFontMetrics().stringWidth(value)).intdiv(2))
+                    g.drawString(value, x * 16 + inset, y * 16 + 13)
+                    // 最低透明度的锚点使 bitmap advance 稳定；不依赖客户端字体测量。
+                    atlas.setRGB(x * 16 + 15, y * 16 + 15, 0x01ffffff)
+                } else chars.append((char)0)
+            }
+            rows.add(chars.toString())
+        }
+        g.dispose()
+        // 紧排支持字符，保留 16px 原始字形细节；不对中文笔画做预先降采样。
+        def packedRows=[]; int packedCount=supported.cardinality(), packedHeight=((packedCount+127).intdiv(128))*16
+        def packed=new BufferedImage(2048,packedHeight,BufferedImage.TYPE_INT_ARGB)
+        def pg=packed.createGraphics(); int glyphIndex=0; def packedLine=new StringBuilder()
+        for (int cp=supported.nextSetBit(0);cp>=0;cp=supported.nextSetBit(cp+1)) {
+            int tx=(glyphIndex%128)*16, ty=glyphIndex.intdiv(128)*16, sx=(cp%256)*16, sy=cp.intdiv(256)*16
+            pg.drawImage(atlas,tx,ty,tx+16,ty+16,sx,sy,sx+16,sy+16,null)
+            packedLine.append((char)cp); glyphIndex++
+            if (glyphIndex%128==0) { packedRows.add(packedLine.toString()); packedLine=new StringBuilder() }
+        }
+        if (packedLine.length()>0) { while(packedLine.length()<128) packedLine.append((char)0); packedRows.add(packedLine.toString()) }
+        pg.dispose(); rows=packedRows
+        ImageIO.write(packed, 'png', new File(target, 'textures/font/glyphs.png'))
+        new File(root, 'book-font.bin').bytes = supported.toByteArray()
+        ['body':[12,9], 'heading':[14,13], 'button':[12,5]].each { name, size ->
+            new File(target, "font/${name}.json").text = JsonOutput.toJson([providers:[
+                [type:'bitmap', file:'handbookcore:font/glyphs.png', height:size[0], ascent:size[1], chars:rows]
+            ]])
+        }
+        // 未收录字符直接使用这一份字体；避免每个 FontSet 都枚举整份 Unicode。
+        new File(target,'font/fallback.json').text=JsonOutput.toJson([providers:[
+            [type:'unihex',hex_file:'minecraft:font/unifont.zip',size_overrides:[[from:'\u0000',to:'\udbff\udfff',left:0,right:15]]]
+        ]])
+        copy { from 'assets/fonts/LICENSE.txt'; into new File(target, 'licenses'); rename { 'Droid-Apache-2.0.txt' } }
+        copy { from 'assets/fonts/DejaVu-LICENSE.txt'; into new File(target, 'licenses') }
+    }
+}
+tasks.register('compileVanillaIcons') {
+    dependsOn 'downloadIconSource'
+    inputs.file(clientSource)
+    outputs.dir(layout.buildDirectory.dir('generated/icon-resources'))
+    doLast {
+        def root = layout.buildDirectory.dir('generated/icon-resources').get().asFile
+        def target = new File(root, 'ce-pack/handbookcore/resourcepack/assets/handbookcore/font/icons.json')
+        target.parentFile.mkdirs()
+        def icons = []; def mappings = new StringBuilder(); int next = 0xe010
+        def parser = new JsonSlurper()
+        new ZipFile(clientSource.asFile).withCloseable { zip ->
+            def readJson = { String path -> def entry = zip.getEntry(path); entry == null ? null : parser.parse(zip.getInputStream(entry)) }
+            def textureFor
+            textureFor = { String model, Set<String> visited ->
+                if (!visited.add(model)) return null
+                String path = model.replace('minecraft:', '')
+                def json = readJson("assets/minecraft/models/${path}.json")
+                if (json == null) return null
+                def textures = new LinkedHashMap(json.textures ?: [:])
+                def chosen = textures.layer0 ?: textures.all ?: textures.top ?: textures.side ?: textures.values().find { !(it as String).startsWith('#') }
+                if (chosen != null && !(chosen as String).startsWith('#')) return chosen as String
+                return json.parent == null ? null : textureFor(json.parent as String, visited)
+            }
+            def findModel
+            findModel = { node ->
+                if (!(node instanceof Map)) return null
+                if (node.type == 'minecraft:model' || node.type == 'model') return node.model
+                for (def key : ['model', 'on_true', 'on_false', 'fallback']) {
+                    def value = findModel(node[key]); if (value != null) return value
+                }
+                if (node.models instanceof List) for (def child : node.models) { def value = findModel(child); if (value != null) return value }
+                return null
+            }
+            zip.entries().toList().findAll { it.name.startsWith('assets/minecraft/items/') && it.name.endsWith('.json') }.sort { it.name }.each { entry ->
+                String id = entry.name.substring('assets/minecraft/items/'.length(), entry.name.length() - 5)
+                String model = findModel(readJson(entry.name)?.model)
+                String texture = model == null ? null : textureFor(model, new HashSet<String>())
+                if (texture == null || !texture.startsWith('minecraft:')) return
+                def textureEntry = zip.getEntry('assets/minecraft/textures/' + texture.substring(10) + '.png')
+                if (textureEntry == null) return
+                def image = ImageIO.read(zip.getInputStream(textureEntry))
+                // 动画纹理也以第一帧展示，交互预览仍使用原生 ItemStack 模型。
+                if (image.height != image.width) return
+                icons.add([id:id, cp:next++, image:image])
+            }
+        }
+        // 每个 bitmap provider 都分配完整 Unicode 索引表。将缩略图合为一张图集，
+        // 避免 1508 个图标 × 多种基线各自分配空表；每个图标仍保留独立码点。
+        int columns = 64, cell = 32, count = icons.size(), rowCount = (count + columns - 1).intdiv(columns)
+        def atlas = new BufferedImage(columns * cell, rowCount * cell, BufferedImage.TYPE_INT_ARGB)
+        def graphics = atlas.createGraphics()
+        graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_NEAREST_NEIGHBOR)
+        def rows = []; def line = new StringBuilder()
+        icons.eachWithIndex { icon, index ->
+            int col = index % columns, row = index.intdiv(columns)
+            graphics.drawImage(icon.image, col * cell, row * cell, cell, cell, null)
+            int right = 0, left = cell
+            for (int x = 0; x < cell; x++) for (int y = 0; y < cell; y++)
+                if ((atlas.getRGB(col * cell + x, row * cell + y) >>> 24) != 0) {
+                    right = Math.max(right, x + 1); left = Math.min(left, x)
+                }
+            mappings.append("${icon.id}=${icon.cp},${right+1},${left},${Math.round(right*0.5f)+1},${Math.round(left*0.5f)}\n")
+            line.appendCodePoint(icon.cp)
+            if ((index + 1) % columns == 0) { rows.add(line.toString()); line = new StringBuilder() }
+        }
+        if (line.length() > 0) { while (line.length() < columns) line.append((char)0); rows.add(line.toString()) }
+        graphics.dispose()
+        def texture = new File(root, 'ce-pack/handbookcore/resourcepack/assets/handbookcore/textures/font/vanilla-icons.png')
+        texture.parentFile.mkdirs(); ImageIO.write(atlas, 'png', texture)
+        target.text = JsonOutput.toJson([providers:[[type:'bitmap',file:'handbookcore:font/vanilla-icons.png',height:32,ascent:7,chars:rows]]])
+        new File(target.parentFile,'icons_small.json').text = JsonOutput.toJson([providers:[
+            [type:'bitmap',file:'handbookcore:font/vanilla-icons.png',height:16,ascent:-1,chars:rows]]])
+        new File(root, 'vanilla-icons.properties').text = mappings.toString()
+        logger.lifecycle("已生成 ${count} 个原版图标缩略图，共用一个 bitmap provider")
+    }
+}
+tasks.named('processResources') {
+    dependsOn 'compileBookFont', 'compileVanillaIcons', 'compileBookmarks', 'compileCompactFonts'
+    doFirst { delete destinationDir }
+    from(layout.buildDirectory.dir('generated/font-resources'))
+    from(layout.buildDirectory.dir('generated/icon-resources'))
+    from(layout.buildDirectory.dir('generated/bookmark-resources'))
+    from(layout.buildDirectory.dir('generated/compact-resources'))
+    doLast {
+        def output = destinationDir
+        def paths = fileTree(new File(output, 'ce-pack')).files.collect { output.toPath().relativize(it.toPath()).toString().replace('\\', '/') }.sort()
+        new File(output, 'ce-pack-files.txt').text = paths.join('\n') + '\n'
+    }
+}
+tasks.named('craftEnginePack') {
+    dependsOn 'compileBookFont', 'compileVanillaIcons', 'compileBookmarks', 'compileCompactFonts'
+    from(layout.buildDirectory.dir('generated/font-resources/ce-pack'))
+    from(layout.buildDirectory.dir('generated/icon-resources/ce-pack'))
+    from(layout.buildDirectory.dir('generated/bookmark-resources/ce-pack'))
+    from(layout.buildDirectory.dir('generated/compact-resources/ce-pack'))
+}
+
+// 原 API 继续使用 520×288 逻辑画布；客户端输出为 56.25%。九种 ascent 补齐原生 9px 行高内的偏移。
+tasks.register('compileCompactFonts') {
+    dependsOn 'compileBookTexture', 'compileBookFont', 'compileVanillaIcons', 'compileBookmarks'
+    def sources = ['book', 'font', 'icon', 'bookmark'].collect { layout.buildDirectory.dir("generated/${it}-resources") }
+    inputs.files(sources)
+    inputs.file('src/main/resources/ce-pack/handbookcore/configuration/images.yml')
+    inputs.file('assets/book-v2.png')
+    outputs.dir(layout.buildDirectory.dir('generated/compact-resources'))
+    doLast {
+        def output = layout.buildDirectory.dir('generated/compact-resources').get().asFile
+        delete output
+        def assetRoot = 'ce-pack/handbookcore/resourcepack/assets'
+        def roots = sources.collect { new File(it.get().asFile, assetRoot) }
+        def fonts = [:]
+        roots.each { root -> fileTree(new File(root, 'handbookcore/font')).matching { include '*.json' }.files.sort().each { f ->
+            if (!(f.name in ['space.json','fallback.json'])) fonts[f.name.replace('.json', '')] = new JsonSlurper().parse(f)
+        } }
+        fonts.paper = [providers: (0..<3).collect { row -> [type:'bitmap',file:"handbookcore:font/paper-${row}.png",
+            height:96,ascent:7-row*96,chars:[new String(((0..<4).collect { 0xe000+row*4+it } as int[]),0,4)]] }]
+        // 先将整图编译到整数 GUI 单元，再切片，避免 70.3125px 字形拼接产生黑缝。
+        def paper = new BufferedImage(560,324,BufferedImage.TYPE_INT_ARGB)
+        def graphics = paper.createGraphics()
+        graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION,RenderingHints.VALUE_INTERPOLATION_BILINEAR)
+        graphics.drawImage(ImageIO.read(file('assets/book-v2.png')),0,0,560,324,null); graphics.dispose()
+        def paperTextures = new File(output,"${assetRoot}/handbookcore/textures/font")
+        paperTextures.mkdirs()
+        for (int row=0;row<3;row++) ImageIO.write(paper.getSubimage(0,row*108,560,108),'png',new File(paperTextures,"compact-paper-${row}.png"))
+        def iconMetrics = new Properties()
+        new File(layout.buildDirectory.dir('generated/icon-resources').get().asFile,'vanilla-icons.properties').withInputStream { iconMetrics.load(it) }
+        def iconByCp = iconMetrics.values().collectEntries { value -> def d=value.split(','); [(d[0] as int):d] }
+        def metrics = new TreeMap<String,String>()
+        def shared = new HashSet<String>()
+        fonts.each { name, font ->
+            font.providers.findAll { it.type == 'bitmap' && !(name in ['body','heading','button']) }.each { provider ->
+                int height = provider.height as int, compact = Math.max(1,Math.round(height*0.5625f))
+                def grid = provider.chars.collect { it.codePoints().toArray() }
+                def fileParts = provider.file.split(':',2)
+                def texture = roots.collect { new File(it, "${fileParts[0]}/textures/${fileParts[1]}") }.find { it.isFile() }
+                def png = texture == null ? null : ImageIO.read(texture)
+                for (int row=0;row<grid.size();row++) for (int col=0;col<grid[row].length;col++) {
+                    int cp=grid[row][col]; if (cp==0) continue
+                    int original, resized
+                    if (png != null) {
+                        int cw=png.width.intdiv(grid[0].length), ch=png.height.intdiv(grid.size()), right=0
+                        for (int x=0;x<cw;x++) for (int y=0;y<ch;y++)
+                            if ((png.getRGB(col*cw+x,row*ch+y)>>>24)!=0) right=Math.max(right,x+1)
+                        original=Math.round(right*height/(float)ch)+1; resized=Math.round(right*compact/(float)ch)+1
+                        if (name=='paper') {
+                            int tileRow=(cp-0xe000).intdiv(4), edge=0
+                            for (int x=0;x<140;x++) for (int y=0;y<108;y++)
+                                if ((paper.getRGB(col*140+x,tileRow*108+y)>>>24)!=0) edge=Math.max(edge,x+1)
+                            resized=Math.round(edge*0.5f)+1
+                        }
+                    } else {
+                        def data=iconByCp[cp]
+                        if (data==null) throw new GradleException("缺少缩放图标指标：${name}/${cp}")
+                        original=Math.round(((data[1] as int)-1)*height/32.0f)+1
+                        resized=Math.round(((data[1] as int)-1)*compact/32.0f)+1
+                    }
+                    metrics["handbookcore:${name}/${cp}"]="${original},${resized}"
+                }
+            }
+            for (int offset=0;offset<9;offset++) {
+                // 未收录字符由输出器保留原字体处理；紧凑字体不再枚举整份 Unicode 回退。
+                def selected = name in ['body','heading','button'] ? font.providers.findAll { it.type=='bitmap' } : font.providers
+                def providers=selected.collect { p ->
+                    def copy=new LinkedHashMap(p)
+                    if (p.type=='bitmap') {
+                        copy.height=Math.max(1,Math.round((p.height as int)*0.5625f))
+                        copy.ascent=Math.min(copy.height as int,7-Math.round((7-(p.ascent as int))*0.5625f)-offset)
+                        if (name=='paper') copy.file=(p.file as String).replace('paper-', 'compact-paper-')
+                        if (name in ['body','heading','button']) {
+                            String id="handbookcore:compact/shared/h${copy.height}_a${copy.ascent}"
+                            if (shared.add(id)) {
+                                def common=new File(output,"${assetRoot}/handbookcore/font/${id.substring(13)}.json")
+                                common.parentFile.mkdirs(); common.text=JsonOutput.toJson([providers:[copy]])
+                            }
+                            copy=[type:'reference',id:id]
+                        }
+                    }
+                    copy
+                }
+                def target=new File(output,"${assetRoot}/handbookcore/font/compact/handbookcore/${name}/${offset}.json")
+                target.parentFile.mkdirs(); target.text=JsonOutput.toJson([providers:providers])
+            }
+        }
+        new File(output,'compact-glyphs.properties').text=metrics.collect { k,v -> "${k.replace(':','\\:')}=${v}" }.join('\n')+'\n'
+    }
+}
+// 图像生成器提供完整书本和同画风的书签图集；构建只切图与缩放，不重新拼画控件。
+tasks.register('compileBookmarks') {
+    inputs.file('assets/bookmarks-source.png')
+    outputs.dir(layout.buildDirectory.dir('generated/bookmark-resources'))
+    doLast {
+        def root = layout.buildDirectory.dir('generated/bookmark-resources/ce-pack/handbookcore/resourcepack/assets/handbookcore').get().asFile
+        new File(root, 'textures/font').mkdirs(); new File(root, 'font').mkdirs()
+        def source = ImageIO.read(file('assets/bookmarks-source.png'))
+        def atlas = new BufferedImage(336,128,BufferedImage.TYPE_INT_ARGB)
+        def g = atlas.createGraphics()
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION,RenderingHints.VALUE_INTERPOLATION_BILINEAR)
+        for (int row=0; row<2; row++) for (int col=0; col<4; col++) {
+            int x0=col*source.width.intdiv(4), x1=(col+1)*source.width.intdiv(4)
+            int y0=row*source.height.intdiv(2), y1=(row+1)*source.height.intdiv(2)
+            int left=x1, right=x0, top=y1, bottom=y0
+            for (int x=x0; x<x1; x++) for (int y=y0; y<y1; y++) if ((source.getRGB(x,y)>>>24)>48) {
+                left=Math.min(left,x); right=Math.max(right,x+1); top=Math.min(top,y); bottom=Math.max(bottom,y+1)
+            }
+            if (right<=left || bottom<=top) throw new GradleException('书签图集缺少单元')
+            g.drawImage(source,col*84,row*64,(col+1)*84,(row+1)*64,left,top,right,bottom,null)
+        }
+        g.dispose(); ImageIO.write(atlas,'png',new File(root,'textures/font/bookmarks.png'))
+        new File(root,'font/bookmarks.json').text = JsonOutput.toJson([providers:[[type:'bitmap',
+            file:'handbookcore:font/bookmarks.png',height:32,ascent:7,chars:['\ue200\ue201\ue202\ue203','\ue204\ue205\ue206\ue207']]]])
+        def hits = []
+        [30,52,82,176,42].eachWithIndex { width,index ->
+            def hit = new BufferedImage(width-1,9,BufferedImage.TYPE_INT_ARGB)
+            for (int x=0; x<width-1; x++) for (int y=0; y<9; y++) hit.setRGB(x,y,0x01ffffff)
+            ImageIO.write(hit,'png',new File(root,"textures/font/hit-${width}.png"))
+            hits.add([type:'bitmap',file:"handbookcore:font/hit-${width}.png",height:9,ascent:7,chars:[String.valueOf((char)(0xe220+index))]])
+        }
+        new File(root,'font/hit.json').text = JsonOutput.toJson([providers:hits])
+    }
+}
